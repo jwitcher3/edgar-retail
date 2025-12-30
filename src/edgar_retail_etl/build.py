@@ -126,8 +126,10 @@ def build_gold(
     con = duckdb.connect(str(duckdb_path))
 
     def _coalesce_max(tags: list[str], alias: str) -> str:
+        if not tags:
+            return f"NULL::DOUBLE AS {alias}"
         parts = [f"MAX(CASE WHEN tag='{t}' THEN val END)" for t in tags]
-        return "COALESCE(" + ", ".join(parts) + f") AS {alias}"
+        return "COALESCE(" + ", ".join(parts) + f") AS {alias}"         
 
     con.execute("CREATE SCHEMA IF NOT EXISTS silver;")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold;")
@@ -151,38 +153,61 @@ def build_gold(
 
     inv_tags = list(xbrl_metrics.get("inventory", []))
     rev_tags = list(xbrl_metrics.get("revenue", []))
+    cogs_tags = list(xbrl_metrics.get("cogs", []))    
     gp_tags = list(xbrl_metrics.get("gross_profit", []))
     op_tags = list(xbrl_metrics.get("op_income", []))
-
+    
     quarter_facts_sql = f"""
     CREATE TABLE gold.quarter_facts AS
     WITH q AS (
-      SELECT
+    SELECT
         ticker,
         tag,
         val::DOUBLE AS val,
         CAST("end" AS DATE) AS end_date
-      FROM silver.xbrl_facts_long
-      WHERE "end" IS NOT NULL
+    FROM silver.xbrl_facts_long
+    WHERE "end" IS NOT NULL
     ),
     q2 AS (
-      SELECT
+    SELECT
         ticker,
         tag,
         val,
         EXTRACT(year FROM end_date) AS year,
         EXTRACT(quarter FROM end_date) AS quarter
-      FROM q
+    FROM q
+    ),
+    agg AS (
+    SELECT
+        ticker,
+        year,
+        quarter,
+        {_coalesce_max(inv_tags, "inventory")},
+        {_coalesce_max(rev_tags, "revenue")},
+        {_coalesce_max(cogs_tags, "cogs")},
+        {_coalesce_max(gp_tags, "gross_profit_raw")},
+        {_coalesce_max(op_tags, "op_income")}
+    FROM q2
+    GROUP BY 1,2,3
     )
     SELECT
-      ticker, year, quarter,
-      {_coalesce_max(inv_tags, "inventory")},
-      {_coalesce_max(rev_tags, "revenue")},
-      {_coalesce_max(gp_tags, "gross_profit")},
-      {_coalesce_max(op_tags, "op_income")}
-    FROM q2
-    GROUP BY 1,2,3;
+    ticker,
+    year,
+    quarter,
+    inventory,
+    revenue,
+    cogs,
+    COALESCE(
+        gross_profit_raw,
+        CASE
+        WHEN revenue IS NOT NULL AND cogs IS NOT NULL THEN revenue - cogs
+        ELSE NULL
+        END
+    ) AS gross_profit,
+    op_income
+    FROM agg;
     """
+
     con.execute(quarter_facts_sql)
 
     con.execute("DROP TABLE IF EXISTS gold.company_quarter_metrics;")
@@ -215,7 +240,7 @@ def build_gold(
         )
         SELECT
           sq.*,
-          qf.inventory, qf.revenue, qf.gross_profit, qf.op_income,
+          qf.inventory, qf.revenue, qf.cogs, qf.gross_profit, qf.op_income,
           COALESCE(sq.kw_inventory,0) + COALESCE(sq.kw_promotion,0) + COALESCE(sq.kw_markdown,0)
             AS pressure_language_score
         FROM sq
@@ -400,14 +425,29 @@ def build_gold(
         if t not in tickers_with_signals:
             warnings.append((run_id, t, "NO_FILINGS_SIGNALS", "No filing_signals rows for ticker"))
 
-    # Missing XBRL tags per ticker
     for t in tickers:
+        if t not in tickers_with_signals:
+            continue
+
         for metric_name, candidate_tags in xbrl_metrics.items():
-            has_any = any((t, tag) in facts_pairs for tag in candidate_tags)
+            # derived gross profit: allow (revenue + cogs) to satisfy even if GrossProfit absent
+            if metric_name == "gross_profit":
+                rev_tags = xbrl_metrics.get("revenue", [])
+                cogs_tags = xbrl_metrics.get("cogs", [])
+                has_rev = any((t, tag) in facts_pairs for tag in rev_tags)
+                has_cogs = any((t, tag) in facts_pairs for tag in cogs_tags)
+                has_gp = any((t, tag) in facts_pairs for tag in candidate_tags)
+                has_any = has_gp or (has_rev and has_cogs)
+            else:
+                has_any = any((t, tag) in facts_pairs for tag in candidate_tags)
+
             if not has_any:
                 warnings.append(
                     (run_id, t, "MISSING_XBRL_METRIC", f"{metric_name}: {candidate_tags}")
-            )
+                )
+
+    # Deduplicate warnings (stable)
+    warnings = list(dict.fromkeys(warnings))
 
     if warnings:
         con.executemany(

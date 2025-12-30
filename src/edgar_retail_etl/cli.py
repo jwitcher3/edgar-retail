@@ -5,8 +5,9 @@ import typer
 
 from .settings import load_settings
 from .http_client import SecClient
-from .ingest import ingest_company_tickers, ticker_to_cik_map, ingest_submissions, ingest_company_facts
+from .ingest import ingest_company_tickers, ticker_to_cik_map, ingest_submissions, ingest_company_facts, load_ticker_overrides, resolve_cik_for_ticker
 from .build import build_silver, build_gold
+
 
 app = typer.Typer(add_completion=False)
 
@@ -20,6 +21,7 @@ def paths(root: Path):
     }
 
 @app.command("ingest")
+@app.command("ingest")
 def ingest(config: str = typer.Option("config.yaml", "--config")):
     s = load_settings(config)
     p = paths(s.root_dir)
@@ -30,18 +32,24 @@ def ingest(config: str = typer.Option("config.yaml", "--config")):
         timeout=s.sec.timeout_seconds,
     )
 
+    # Download/refresh mapping parquet (now should include exchange json too)
     tickers_pq = ingest_company_tickers(client, p["bronze"])
-    cik_map = ticker_to_cik_map(tickers_pq)
+    ticker_map = ticker_to_cik_map(tickers_pq)
+
+    # Local override map (data/bronze/ticker_overrides.json)
+    overrides = load_ticker_overrides(p["bronze"])
 
     for t in s.project.tickers:
-        cik = cik_map.get(t.upper())
+        cik = resolve_cik_for_ticker(t, ticker_map, overrides=overrides)
         if not cik:
             typer.echo(f"[skip] No CIK for {t}")
             continue
+
         ingest_submissions(client, cik, p["bronze"])
         ingest_company_facts(client, cik, p["bronze"])
 
     typer.echo("Done: ingest")
+
 
 @app.command("silver")
 def silver(config: str = typer.Option("config.yaml", "--config")):
@@ -97,8 +105,8 @@ def gold(config: str = typer.Option("config.yaml", "--config")):
             "keywords": s.signals.keywords,
             "xbrl_metrics": s.xbrl.metrics,
             "xbrl_tags": s.xbrl.all_tags,
-    },
-)
+        },
+    )
     typer.echo("Done: gold")
 
 @app.command("validate")

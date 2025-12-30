@@ -52,11 +52,26 @@ def filings_to_df(filings: Iterable[FilingRef]) -> pd.DataFrame:
     return pd.DataFrame([f.__dict__ for f in filings])
 
 
-def html_to_text(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
+def _soup_for_content(raw: str) -> BeautifulSoup:
+    # Very lightweight detection: XML filings/exhibits often start with '<?xml' or have an <xbrl> root
+    head = raw.lstrip()[:200].lower()
+    if head.startswith("<?xml") or "<xbrl" in head or "<xml" in head:
+        return BeautifulSoup(raw, "xml")  # uses lxml's XML parser (already installed)
+    return BeautifulSoup(raw, "lxml")
+
+def parse_primary_document(raw: str) -> str:
+    return extract_text_from_raw(raw)
+
+def extract_text_from_raw(raw: str) -> str:
+    soup = _soup_for_content(raw)
+
+    # If HTML, remove script/style/noscript
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    return " ".join(soup.get_text(separator=" ").split())
+
+    text = soup.get_text(" ", strip=True)
+    # collapse extra whitespace
+    return " ".join(text.split())
 
 
 def compute_keyword_counts(text: str, keywords: list[str]) -> dict[str, int]:
@@ -65,4 +80,18 @@ def compute_keyword_counts(text: str, keywords: list[str]) -> dict[str, int]:
 
 
 def primary_doc_url(f: FilingRef) -> str:
-    return filing_primary_doc_url(f.cik, f.accession, f.primary_doc)
+    # Prefer HTML if primary doc is XML
+    pdoc = f.primary_doc
+    if pdoc.lower().endswith(".xml"):
+        # common fallback names used by filings; you can expand this list
+        for candidate in ["d10k.htm", "d10q.htm", "form10k.htm", "form10q.htm", "10k.htm", "10q.htm"]:
+            # try candidate only if your pipeline supports trying alternates
+            pass
+    return filing_primary_doc_url(f.cik, f.accession, pdoc)
+
+def html_to_text(html: str) -> str:
+    """
+    Backwards-compatible name expected by build.py.
+    Accepts HTML or XML-ish content and returns normalized text.
+    """
+    return extract_text_from_raw(html)

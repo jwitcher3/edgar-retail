@@ -16,8 +16,34 @@ if not DB.exists():
     st.stop()
 
 con = duckdb.connect(str(DB), read_only=True)
-df = con.execute("SELECT * FROM gold.company_quarter_metrics ORDER BY year DESC, quarter DESC, ticker").df()
+
+st.subheader("Latest run")
+
+try:
+    run = con.execute("SELECT * FROM gold.run_log ORDER BY run_ts DESC LIMIT 1").df()
+    st.dataframe(run, width="stretch")
+    rid = run.loc[0, "run_id"]
+    warns = con.execute(
+        "SELECT ticker, warning_type, detail FROM gold.run_warnings WHERE run_id = ? ORDER BY ticker, warning_type",
+        [rid],
+    ).df()
+    if len(warns) > 0:
+        st.warning("Warnings found")
+        st.dataframe(warns, width="stretch")
+    else:
+        st.success("No warnings")
+except Exception as e:
+    st.info("Run log not available yet. Re-run gold to generate gold.run_log.")
+
+
+df = con.execute(
+    "SELECT * FROM gold.pressure_index ORDER BY year DESC, quarter DESC, ticker"
+).df()
 con.close()
+
+df["period"] = df["year"].astype(str) + " Q" + df["quarter"].astype(str)
+df["sort_key"] = df["year"] * 10 + df["quarter"]
+df = df.sort_values(["sort_key", "ticker"])
 
 tickers = sorted(df["ticker"].unique().tolist())
 selected = st.multiselect("Tickers", tickers, default=tickers[:5])
@@ -25,3 +51,11 @@ dff = df[df["ticker"].isin(selected)].copy()
 
 st.dataframe(dff, width='stretch')
 st.bar_chart(dff.set_index("ticker")[["pressure_language_score"]])
+
+chart_df = dff.pivot_table(
+    index="period",
+    columns="ticker",
+    values="pressure_index",
+    aggfunc="mean"
+)
+st.line_chart(chart_df)

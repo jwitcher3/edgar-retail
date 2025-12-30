@@ -1,4 +1,5 @@
 COMPANY_TICKERS_JSON = "https://www.sec.gov/files/company_tickers.json"
+COMPANY_TICKERS_EXCHANGE_JSON = "https://www.sec.gov/files/company_tickers_exchange.json"
 SUBMISSIONS_JSON = "https://data.sec.gov/submissions/CIK{cik10}.json"
 COMPANY_FACTS_JSON = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik10}.json"
 
