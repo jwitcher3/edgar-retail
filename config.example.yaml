@@ -1,0 +1,27 @@
+sec:
+  user_agent: "EDGAR Retail ETL JamesWitcher james.witcher@outlook.com"
+  max_requests_per_second: 5
+  timeout_seconds: 30
+
+project:
+  tickers: ["NKE", "DECK", "SKX", "VFC", "LULU", "TPR", "RL", "AEO", "FL", "TGT"]
+  forms: ["10-K", "10-Q"]
+  filings_per_company: 8
+
+signals:
+  keywords:
+    - "inventory"
+    - "promotion"
+    - "promotional"
+    - "markdown"
+    - "demand"
+    - "traffic"
+    - "pricing"
+    - "guidance"
+
+xbrl:
+  tags:
+    - "InventoryNet"
+    - "NetSales"
+    - "GrossProfit"
+    - "OperatingIncomeLoss"
