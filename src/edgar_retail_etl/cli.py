@@ -46,6 +46,14 @@ def ingest(config: str = typer.Option("config.yaml", "--config")):
 @app.command("silver")
 def silver(config: str = typer.Option("config.yaml", "--config")):
     s = load_settings(config)
+    if not s.project.tickers:
+        raise typer.BadParameter("config.yaml project.tickers is empty.")
+    if not s.signals.keywords:
+        raise typer.BadParameter("config.yaml signals.keywords is empty.")
+    if not s.xbrl.tags:
+        raise typer.BadParameter("config.yaml xbrl.tags is empty.")
+
+
     p = paths(s.root_dir)
 
     client = SecClient(
