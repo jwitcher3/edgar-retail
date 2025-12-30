@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from duckdb import alias
 import pandas as pd
+import json
+import uuid
+from datetime import datetime, timezone
 
 from .http_client import SecClient
 from .ingest import ticker_to_cik_map
@@ -108,10 +112,23 @@ def build_silver(
     return filings_out, signals_out, facts_out
 
 
-def build_gold(silver_dir: Path, duckdb_path: Path, gold_dir: Path) -> tuple[Path, Path]:
+def build_gold(
+    silver_dir: Path,
+    duckdb_path: Path,
+    gold_dir: Path,
+    run_context: dict | None = None,
+) -> tuple[Path, Path]:
+
+
+
     import duckdb
 
     con = duckdb.connect(str(duckdb_path))
+
+    def _coalesce_max(tags: list[str], alias: str) -> str:
+        parts = [f"MAX(CASE WHEN tag='{t}' THEN val END)" for t in tags]
+        return "COALESCE(" + ", ".join(parts) + f") AS {alias}"
+
     con.execute("CREATE SCHEMA IF NOT EXISTS silver;")
     con.execute("CREATE SCHEMA IF NOT EXISTS gold;")
 
@@ -128,37 +145,45 @@ def build_gold(silver_dir: Path, duckdb_path: Path, gold_dir: Path) -> tuple[Pat
     )
 
     con.execute("DROP TABLE IF EXISTS gold.quarter_facts;")
-    con.execute(
-        """
-        CREATE TABLE gold.quarter_facts AS
-        WITH q AS (
-            SELECT
-                ticker,
-                tag,
-                val::DOUBLE AS val,
-                CAST("end" AS DATE) AS end_date
-            FROM silver.xbrl_facts_long
-            WHERE "end" IS NOT NULL
-        ),
-        q2 AS (
-            SELECT
-                ticker,
-                tag,
-                val,
-                EXTRACT(year FROM end_date) AS year,
-                EXTRACT(quarter FROM end_date) AS quarter
-            FROM q
-        )
-        SELECT
-            ticker, year, quarter,
-            MAX(CASE WHEN tag='InventoryNet' THEN val END) AS inventory_net,
-            MAX(CASE WHEN tag='NetSales' THEN val END) AS net_sales,
-            MAX(CASE WHEN tag='GrossProfit' THEN val END) AS gross_profit,
-            MAX(CASE WHEN tag='OperatingIncomeLoss' THEN val END) AS op_income_loss
-        FROM q2
-        GROUP BY 1,2,3;
-        """
+
+    ctx = run_context or {}
+    xbrl_metrics = ctx.get("xbrl_metrics") or {}
+
+    inv_tags = list(xbrl_metrics.get("inventory", []))
+    rev_tags = list(xbrl_metrics.get("revenue", []))
+    gp_tags = list(xbrl_metrics.get("gross_profit", []))
+    op_tags = list(xbrl_metrics.get("op_income", []))
+
+    quarter_facts_sql = f"""
+    CREATE TABLE gold.quarter_facts AS
+    WITH q AS (
+      SELECT
+        ticker,
+        tag,
+        val::DOUBLE AS val,
+        CAST("end" AS DATE) AS end_date
+      FROM silver.xbrl_facts_long
+      WHERE "end" IS NOT NULL
+    ),
+    q2 AS (
+      SELECT
+        ticker,
+        tag,
+        val,
+        EXTRACT(year FROM end_date) AS year,
+        EXTRACT(quarter FROM end_date) AS quarter
+      FROM q
     )
+    SELECT
+      ticker, year, quarter,
+      {_coalesce_max(inv_tags, "inventory")},
+      {_coalesce_max(rev_tags, "revenue")},
+      {_coalesce_max(gp_tags, "gross_profit")},
+      {_coalesce_max(op_tags, "op_income")}
+    FROM q2
+    GROUP BY 1,2,3;
+    """
+    con.execute(quarter_facts_sql)
 
     con.execute("DROP TABLE IF EXISTS gold.company_quarter_metrics;")
     con.execute(
@@ -190,7 +215,7 @@ def build_gold(silver_dir: Path, duckdb_path: Path, gold_dir: Path) -> tuple[Pat
         )
         SELECT
           sq.*,
-          qf.inventory_net, qf.net_sales, qf.gross_profit, qf.op_income_loss,
+          qf.inventory, qf.revenue, qf.gross_profit, qf.op_income,
           COALESCE(sq.kw_inventory,0) + COALESCE(sq.kw_promotion,0) + COALESCE(sq.kw_markdown,0)
             AS pressure_language_score
         FROM sq
@@ -198,6 +223,237 @@ def build_gold(silver_dir: Path, duckdb_path: Path, gold_dir: Path) -> tuple[Pat
           ON sq.ticker=qf.ticker AND sq.year=qf.year AND sq.quarter=qf.quarter;
         """
     )
+
+    con.execute("DROP TABLE IF EXISTS gold.company_quarter_features;")
+    con.execute(
+        """
+        CREATE TABLE gold.company_quarter_features AS
+        WITH base AS (
+          SELECT
+            *,
+            CASE
+              WHEN revenue IS NOT NULL AND revenue != 0 AND inventory IS NOT NULL
+              THEN inventory / revenue
+              ELSE NULL
+            END AS inventory_to_sales
+          FROM gold.company_quarter_metrics
+        ),
+        lagged AS (
+          SELECT
+            *,
+            LAG(inventory) OVER (PARTITION BY ticker ORDER BY year, quarter) AS inventory_net_prev_q,
+            LAG(revenue) OVER (PARTITION BY ticker ORDER BY year, quarter) AS net_sales_prev_q,
+            LAG(pressure_language_score) OVER (PARTITION BY ticker ORDER BY year, quarter) AS pressure_prev_q,
+            LAG(inventory_to_sales) OVER (PARTITION BY ticker ORDER BY year, quarter) AS inv_to_sales_prev_q
+          FROM base
+        )
+        SELECT
+          *,
+          CASE
+            WHEN inventory_net_prev_q IS NOT NULL AND inventory_net_prev_q != 0 AND inventory IS NOT NULL
+            THEN (inventory - inventory_net_prev_q) / inventory_net_prev_q
+            ELSE NULL
+          END AS inventory_net_qoq_pct,
+          CASE
+            WHEN net_sales_prev_q IS NOT NULL AND net_sales_prev_q != 0 AND revenue IS NOT NULL
+            THEN (revenue - net_sales_prev_q) / net_sales_prev_q
+            ELSE NULL
+          END AS net_sales_qoq_pct,
+          CASE
+            WHEN pressure_prev_q IS NOT NULL AND pressure_prev_q != 0 AND pressure_language_score IS NOT NULL
+            THEN (pressure_language_score - pressure_prev_q) * 1.0 / pressure_prev_q
+            ELSE NULL
+          END AS pressure_qoq_pct,
+          CASE
+            WHEN inv_to_sales_prev_q IS NOT NULL AND inv_to_sales_prev_q != 0 AND inventory_to_sales IS NOT NULL
+            THEN (inventory_to_sales - inv_to_sales_prev_q) / inv_to_sales_prev_q
+            ELSE NULL
+          END AS inventory_to_sales_qoq_pct
+        FROM lagged;
+        """
+    )
+
+    con.execute("DROP TABLE IF EXISTS gold.pressure_index;")
+    con.execute(
+        """
+        CREATE TABLE gold.pressure_index AS
+        WITH f AS (
+          SELECT
+            ticker, year, quarter,
+            pressure_language_score,
+            inventory_to_sales
+          FROM gold.company_quarter_features
+        ),
+        stats AS (
+          SELECT
+            year, quarter,
+            AVG(pressure_language_score) AS m_pressure,
+            STDDEV_SAMP(pressure_language_score) AS s_pressure,
+            AVG(inventory_to_sales) AS m_inv2sales,
+            STDDEV_SAMP(inventory_to_sales) AS s_inv2sales
+          FROM f
+          GROUP BY 1,2
+        )
+        SELECT
+          f.ticker,
+          f.year,
+          f.quarter,
+          f.pressure_language_score,
+          f.inventory_to_sales,
+          CASE
+            WHEN stats.s_pressure IS NOT NULL AND stats.s_pressure != 0 AND f.pressure_language_score IS NOT NULL
+            THEN (f.pressure_language_score - stats.m_pressure) / stats.s_pressure
+            ELSE NULL
+          END AS z_pressure_language,
+          CASE
+            WHEN stats.s_inv2sales IS NOT NULL AND stats.s_inv2sales != 0 AND f.inventory_to_sales IS NOT NULL
+            THEN (f.inventory_to_sales - stats.m_inv2sales) / stats.s_inv2sales
+            ELSE NULL
+          END AS z_inventory_to_sales,
+          -- Simple composite index (equal weight)
+          CASE
+            WHEN
+              (stats.s_pressure IS NOT NULL AND stats.s_pressure != 0 AND f.pressure_language_score IS NOT NULL)
+              OR
+              (stats.s_inv2sales IS NOT NULL AND stats.s_inv2sales != 0 AND f.inventory_to_sales IS NOT NULL)
+            THEN
+              COALESCE((f.pressure_language_score - stats.m_pressure) / NULLIF(stats.s_pressure,0), 0)
+              +
+              COALESCE((f.inventory_to_sales - stats.m_inv2sales) / NULLIF(stats.s_inv2sales,0), 0)
+            ELSE NULL
+          END AS pressure_index
+        FROM f
+        JOIN stats USING (year, quarter);
+        """
+    )
+    # ---------------------------
+    # Run log + data quality checks
+    # ---------------------------
+    run_id = str(uuid.uuid4())
+    run_ts = datetime.now(timezone.utc)
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gold.run_log (
+          run_id VARCHAR,
+          run_ts TIMESTAMPTZ,
+          tickers_json VARCHAR,
+          forms_json VARCHAR,
+          filings_per_company INTEGER,
+          keywords_count INTEGER,
+          tags_count INTEGER,
+          filing_signals_rows BIGINT,
+          xbrl_facts_rows BIGINT,
+          pressure_index_rows BIGINT,
+          warnings_count BIGINT
+        );
+        """
+    )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS gold.run_warnings (
+          run_id VARCHAR,
+          ticker VARCHAR,
+          warning_type VARCHAR,
+          detail VARCHAR
+        );
+        """
+    )
+
+    # Counts from silver/gold
+    filing_signals_rows = con.execute("SELECT COUNT(*) FROM silver.filing_signals").fetchone()[0]
+    xbrl_facts_rows = con.execute("SELECT COUNT(*) FROM silver.xbrl_facts_long").fetchone()[0]
+
+    # pressure_index may not exist if you haven't created it yet in your build
+    pressure_index_rows = 0
+    try:
+        pressure_index_rows = con.execute("SELECT COUNT(*) FROM gold.pressure_index").fetchone()[0]
+    except Exception:
+        pressure_index_rows = 0
+
+    ctx = run_context or {}
+    tickers = [str(t).upper() for t in ctx.get("tickers", [])]
+    xbrl_metrics = ctx.get("xbrl_metrics") or {}
+    tags = [str(x) for x in ctx.get("tags", [])]
+    forms = [str(x) for x in ctx.get("forms", [])]
+    filings_per_company = int(ctx.get("filings_per_company", 0) or 0)
+    keywords_count = int(len(ctx.get("keywords", []) or []))
+    tags_count = int(len(tags))
+
+    # Which tickers had any filing signals?
+    tickers_with_signals = set(
+        r[0]
+        for r in con.execute("SELECT DISTINCT ticker FROM silver.filing_signals").fetchall()
+    )
+
+    # Which (ticker, tag) pairs exist?
+    facts_pairs = set(
+        (r[0], r[1])
+        for r in con.execute("SELECT DISTINCT ticker, tag FROM silver.xbrl_facts_long").fetchall()
+    )
+
+    warnings = []
+
+    # Missing signals
+    for t in tickers:
+        if t not in tickers_with_signals:
+            warnings.append((run_id, t, "NO_FILINGS_SIGNALS", "No filing_signals rows for ticker"))
+
+    # Missing XBRL tags per ticker
+    for t in tickers:
+        for metric_name, candidate_tags in xbrl_metrics.items():
+            has_any = any((t, tag) in facts_pairs for tag in candidate_tags)
+            if not has_any:
+                warnings.append(
+                    (run_id, t, "MISSING_XBRL_METRIC", f"{metric_name}: {candidate_tags}")
+            )
+
+    if warnings:
+        con.executemany(
+            "INSERT INTO gold.run_warnings (run_id, ticker, warning_type, detail) VALUES (?, ?, ?, ?)",
+            warnings,
+        )
+
+    warnings_count = len(warnings)
+
+    con.execute(
+        """
+        INSERT INTO gold.run_log (
+          run_id, run_ts, tickers_json, forms_json, filings_per_company,
+          keywords_count, tags_count,
+          filing_signals_rows, xbrl_facts_rows, pressure_index_rows, warnings_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            run_id,
+            run_ts,
+            json.dumps(tickers),
+            json.dumps(forms),
+            filings_per_company,
+            keywords_count,
+            tags_count,
+            filing_signals_rows,
+            xbrl_facts_rows,
+            pressure_index_rows,
+            warnings_count,
+        ],
+    )
+
+    # Export run log snapshots to gold/ as Parquet for quick inspection
+    gold_dir.mkdir(parents=True, exist_ok=True)
+    con.execute(
+        "COPY (SELECT * FROM gold.run_log ORDER BY run_ts DESC) TO ? (FORMAT PARQUET);",
+        [str(gold_dir / "run_log.parquet")],
+    )
+    con.execute(
+        "COPY (SELECT * FROM gold.run_warnings) TO ? (FORMAT PARQUET);",
+        [str(gold_dir / "run_warnings.parquet")],
+    )
+
+
+
 
     gold_dir.mkdir(parents=True, exist_ok=True)
     out_metrics = gold_dir / "company_quarter_metrics.parquet"

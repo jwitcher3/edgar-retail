@@ -26,7 +26,20 @@ class SignalsSettings:
 
 @dataclass(frozen=True)
 class XbrlSettings:
-    tags: list[str]
+    metrics: dict[str, list[str]]
+
+    @property
+    def all_tags(self) -> list[str]:
+        # Flatten + preserve order + de-dupe
+        seen = set()
+        out: list[str] = []
+        for _, tags in (self.metrics or {}).items():
+            for t in tags:
+                if t not in seen:
+                    seen.add(t)
+                    out.append(t)
+        return out
+
 
 
 @dataclass(frozen=True)
@@ -46,11 +59,17 @@ def load_settings(config_path: str | Path) -> Settings:
     sec = raw.get("sec", {})
     proj = raw.get("project", {})
     sig = raw.get("signals", {})
-    xbrl = raw.get("xbrl", {})
+    xbrl_raw = raw.get("xbrl", {}) or {}
+    metrics = xbrl_raw.get("metrics")
 
     user_agent = str(sec.get("user_agent", "")).strip()
     if not user_agent or "@" not in user_agent:
         raise ValueError("sec.user_agent must include contact info (e.g., an email).")
+    
+    # Back-compat if someone still has xbrl.tags
+    if metrics is None:
+        tags = list(xbrl_raw.get("tags", []))
+        metrics = {"inventory": tags} if tags else {}
 
     return Settings(
         sec=SecSettings(
@@ -64,6 +83,6 @@ def load_settings(config_path: str | Path) -> Settings:
             filings_per_company=int(proj.get("filings_per_company", 8)),
         ),
         signals=SignalsSettings(keywords=list(sig.get("keywords", []))),
-        xbrl=XbrlSettings(tags=list(xbrl.get("tags", []))),
+        xbrl=XbrlSettings(metrics={k: list(v) for k, v in (metrics or {}).items()}),
         root_dir=root_dir,
     )

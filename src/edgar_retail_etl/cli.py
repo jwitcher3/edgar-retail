@@ -50,8 +50,9 @@ def silver(config: str = typer.Option("config.yaml", "--config")):
         raise typer.BadParameter("config.yaml project.tickers is empty.")
     if not s.signals.keywords:
         raise typer.BadParameter("config.yaml signals.keywords is empty.")
-    if not s.xbrl.tags:
-        raise typer.BadParameter("config.yaml xbrl.tags is empty.")
+    if not s.xbrl.metrics:
+        raise typer.BadParameter("config.yaml xbrl.metrics is empty.")
+
 
 
     p = paths(s.root_dir)
@@ -75,7 +76,7 @@ def silver(config: str = typer.Option("config.yaml", "--config")):
         forms=s.project.forms,
         filings_per_company=s.project.filings_per_company,
         keywords=s.signals.keywords,
-        tags=s.xbrl.tags,
+        tags=s.xbrl.all_tags,
     )
 
     typer.echo("Done: silver")
@@ -89,8 +90,67 @@ def gold(config: str = typer.Option("config.yaml", "--config")):
         silver_dir=p["silver"],
         duckdb_path=p["duckdb"],
         gold_dir=p["gold"],
-    )
+        run_context={
+            "tickers": s.project.tickers,
+            "forms": s.project.forms,
+            "filings_per_company": s.project.filings_per_company,
+            "keywords": s.signals.keywords,
+            "xbrl_metrics": s.xbrl.metrics,
+            "xbrl_tags": s.xbrl.all_tags,
+    },
+)
     typer.echo("Done: gold")
+
+@app.command("validate")
+def validate(config: str = typer.Option("config.yaml", "--config")):
+    import duckdb
+
+    s = load_settings(config)
+    p = paths(s.root_dir)
+
+    if not p["duckdb"].exists():
+        raise typer.BadParameter("DuckDB not found. Run gold first.")
+
+    con = duckdb.connect(str(p["duckdb"]), read_only=True)
+
+    # latest run
+    try:
+        run = con.execute(
+            "SELECT * FROM gold.run_log ORDER BY run_ts DESC LIMIT 1"
+        ).fetchdf()
+    except Exception:
+        con.close()
+        typer.echo("No gold.run_log found. Re-run gold after adding run log.")
+        raise typer.Exit(code=1)
+
+    r = run.iloc[0].to_dict()
+    typer.echo("\n=== Latest run ===")
+    typer.echo(f"run_ts (UTC): {r.get('run_ts')}")
+    typer.echo(f"filing_signals_rows: {r.get('filing_signals_rows')}")
+    typer.echo(f"xbrl_facts_rows: {r.get('xbrl_facts_rows')}")
+    typer.echo(f"pressure_index_rows: {r.get('pressure_index_rows')}")
+    typer.echo(f"warnings_count: {r.get('warnings_count')}\n")
+
+    # warnings preview
+    w = con.execute(
+        """
+        SELECT ticker, warning_type, detail
+        FROM gold.run_warnings
+        WHERE run_id = ?
+        ORDER BY ticker, warning_type
+        LIMIT 50
+        """,
+        [r["run_id"]],
+    ).fetchall()
+
+    if w:
+        typer.echo("=== Warnings (up to 50) ===")
+        for t, wt, d in w:
+            typer.echo(f"- {t}: {wt} ({d})")
+    else:
+        typer.echo("No warnings ✅")
+
+    con.close()
 
 if __name__ == "__main__":
     app()
