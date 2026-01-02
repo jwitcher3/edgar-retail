@@ -149,7 +149,7 @@ def build_silver(
     df_text = df_text.reindex(columns=filing_text_cols)
     df_text.to_parquet(filing_text_out, index=False)
 
-    return filings_out, signals_out, facts_out
+    return filings_out, signals_out, facts_out, filing_text_out
 
 
 
@@ -177,7 +177,7 @@ def build_gold(
 
     con.execute("DROP TABLE IF EXISTS silver.filing_signals;")
     con.execute("DROP TABLE IF EXISTS silver.xbrl_facts_long;")
-    con.execute("DROP TABLE IF EXISTS silver.filing_text;")  # NEW
+    con.execute("DROP TABLE IF EXISTS silver.filing_text;")  
 
     con.execute(
         "CREATE TABLE silver.filing_signals AS SELECT * FROM read_parquet(?);",
@@ -191,7 +191,6 @@ def build_gold(
         "CREATE TABLE silver.filing_text AS SELECT * FROM read_parquet(?);",
         [str(silver_dir / "filing_text.parquet")],
     )
-
 
     con.execute("DROP TABLE IF EXISTS gold.quarter_facts;")
 

@@ -5,6 +5,166 @@ import duckdb
 import pandas as pd
 import streamlit as st
 import re
+import html
+import hashlib
+from difflib import SequenceMatcher
+
+def _normalize_ws(s: str) -> str:
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+def split_into_segments(text: str, max_len: int = 650, min_len: int = 80) -> list[str]:
+    """
+    Split filing text into readable segments.
+    1) paragraphs (blank-line separated)
+    2) if a paragraph is very long, chunk it by sentence-ish boundaries
+    """
+    text = _normalize_ws(text)
+    if not text:
+        return []
+
+    paras = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+    segs: list[str] = []
+
+    sentence_split = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
+
+    for p in paras:
+        p = re.sub(r"\s+", " ", p).strip()
+        if len(p) < min_len:
+            continue
+
+        if len(p) <= max_len:
+            segs.append(p)
+            continue
+
+        # Chunk long paragraph into ~max_len blocks using sentence-ish splits
+        sentences = sentence_split.split(p)
+        buf = ""
+        for s in sentences:
+            s = s.strip()
+            if not s:
+                continue
+            if not buf:
+                buf = s
+            elif len(buf) + 1 + len(s) <= max_len:
+                buf = buf + " " + s
+            else:
+                if len(buf) >= min_len:
+                    segs.append(buf)
+                buf = s
+        if buf and len(buf) >= min_len:
+            segs.append(buf)
+
+    # De-dupe exact duplicates
+    seen = set()
+    out = []
+    for s in segs:
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
+
+def score_segment(seg: str, terms: list[str]) -> tuple[float, dict[str, int]]:
+    """
+    Simple, robust scoring:
+      - counts occurrences of each term (case-insensitive)
+      - bonus for multiple distinct terms in same segment
+      - mild length preference (best around ~240 chars)
+    """
+    lo = seg.lower()
+    hits: dict[str, int] = {}
+    raw = 0.0
+
+    for t in terms:
+        t2 = t.strip()
+        if not t2:
+            continue
+        c = len(re.findall(re.escape(t2.lower()), lo))
+        if c:
+            hits[t2] = c
+            # base + repeats
+            raw += 3.0 + 2.0 * (c - 1)
+
+    if not hits:
+        return 0.0, {}
+
+    # bonus for multiple distinct terms
+    if len(hits) >= 2:
+        raw += 2.0 * (len(hits) - 1)
+
+    # length normalization: prefer ~240 chars, but don’t kill longer segments
+    target = 240.0
+    length = float(len(seg))
+    length_factor = 1.0 / (1.0 + abs(length - target) / target)
+
+    return raw * length_factor, hits
+
+def _is_too_similar(a: str, b: str, thresh: float = 0.90) -> bool:
+    # Cheap near-duplicate filter
+    return SequenceMatcher(None, a, b).ratio() >= thresh
+
+def top_excerpts(text: str, terms: list[str], top_n: int = 10) -> list[dict]:
+    terms = [t.strip() for t in terms if t and t.strip()]
+    if not terms:
+        return []
+
+    segs = split_into_segments(text)
+    scored = []
+    for seg in segs:
+        score, hits = score_segment(seg, terms)
+        if score > 0:
+            scored.append((score, hits, seg))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    picked: list[dict] = []
+    for score, hits, seg in scored:
+        # near-duplicate suppression
+        if any(_is_too_similar(seg, p["text"]) for p in picked):
+            continue
+        picked.append({"score": score, "hits": hits, "text": seg})
+        if len(picked) >= top_n:
+            break
+    return picked
+
+def highlight_terms(text: str, terms: list[str]) -> str:
+    """
+    Safely highlight terms using <mark>, while HTML-escaping everything else.
+    """
+    terms_sorted = [t for t in sorted({t.strip() for t in terms if t and t.strip()}, key=len, reverse=True)]
+    tmp = text
+
+    # Insert marker tokens on original text (preserves original casing),
+    # then HTML-escape, then swap tokens for <mark> tags.
+    for i, t in enumerate(terms_sorted):
+        tmp = re.sub(
+            re.escape(t),
+            lambda m, i=i: f"[[[MARK{i}]]]{m.group(0)}[[[ENDMARK{i}]]]",
+            tmp,
+            flags=re.IGNORECASE,
+        )
+
+    tmp = html.escape(tmp)
+
+    for i, _ in enumerate(terms_sorted):
+        tmp = tmp.replace(f"[[[MARK{i}]]]", "<mark>").replace(f"[[[ENDMARK{i}]]]", "</mark>")
+
+    return tmp.replace("\n", " ")
+
+@st.cache_data(show_spinner=False)
+def cached_top_excerpts(text_hash: str, terms_tuple: tuple[str, ...], top_n: int, text: str):
+    return top_excerpts(text, list(terms_tuple), top_n)
+
+# --- Integration (put inside your Filing Explorer section, after you have `txt` and `selected_terms`) ----
+# Example:
+# txt = ...  # full filing text
+# selected_terms = ...  # list of user-selected driver terms
+
+# --- End C3 ------------------------------------------------------------------
 
 st.set_page_config(page_title="Company Deep Dive", layout="wide")
 
@@ -373,12 +533,42 @@ else:
                     for s in snippets:
                         st.write(s)
 
-        with st.expander("Preview raw filing text (first 10,000 chars)"):
-            st.text(text_blob[:10000])
+        # ---- C3: Top excerpts ----
+        st.subheader("Top excerpts")
 
-        st.download_button(
-            "Download full filing text (TXT)",
-            data=text_blob.encode("utf-8", errors="ignore"),
-            file_name=f"{ticker}_{accn}.txt",
-            mime="text/plain",
-        )
+        top_n = st.slider("How many excerpts?", 5, 25, 10, 1, key="top_excerpt_n")
+
+        ex_terms = [t for t in terms_to_search if t]
+        if not ex_terms:
+            st.info("Pick at least one keyword (or type a custom term) to generate excerpts.")
+        else:
+            h = hashlib.sha1(text_blob.encode("utf-8", errors="ignore")).hexdigest()
+            excerpts = cached_top_excerpts(h, tuple(ex_terms), int(top_n), text_blob)
+
+            if not excerpts:
+                st.info("No excerpts found for those terms.")
+            else:
+                for i, ex in enumerate(excerpts, start=1):
+                    hits_str = ", ".join(
+                        f"{k}×{v}" for k, v in sorted(ex["hits"].items(), key=lambda kv: (-kv[1], kv[0]))
+                    )
+                    st.markdown(f"**#{i}** • **Score:** {ex['score']:.2f} • **Hits:** {hits_str}")
+
+                    box = highlight_terms(ex["text"], ex_terms)
+                    st.markdown(
+                        f"<div style='padding:0.75rem 0.9rem;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa;line-height:1.45'>"
+                        f"{box}"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+
+
+                with st.expander("Preview raw filing text (first 10,000 chars)"):
+                    st.text(text_blob[:10000])
+
+                st.download_button(
+                    "Download full filing text (TXT)",
+                    data=text_blob.encode("utf-8", errors="ignore"),
+                    file_name=f"{ticker}_{accn}.txt",
+                    mime="text/plain",
+                )
