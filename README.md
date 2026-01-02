@@ -1,5 +1,15 @@
 # EDGAR Retail ETL (Local-first, VS Code)
 
+## Quickstart
+
+```bash
+make venv
+make install
+make ingest
+make pipeline
+make app
+
+
 ## Setup
 ```bash
 python -m venv .venv
