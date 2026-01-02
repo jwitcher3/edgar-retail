@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+from pathlib import Path
+import duckdb
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="Company Deep Dive", layout="wide")
+
+ROOT = Path(__file__).resolve().parents[2]  # dash/pages -> repo root
+DB = ROOT / "data" / "warehouse.duckdb"
+
+st.title("Company Deep Dive")
+st.caption("Quarterly pressure signals + financial context pulled from SEC EDGAR (DuckDB gold tables).")
+
+if not DB.exists():
+    st.error("DuckDB not found. Run: `make pipeline` (or `make gold`) first.")
+    st.stop()
+
+@st.cache_data(show_spinner=False)
+def load_tickers(db_path: Path) -> list[str]:
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        tickers = con.execute(
+            "SELECT DISTINCT ticker FROM gold.pressure_index ORDER BY ticker"
+        ).fetchall()
+        return [t[0] for t in tickers]
+    finally:
+        con.close()
+
+@st.cache_data(show_spinner=False)
+def load_company_quarters(db_path: Path, ticker: str) -> pd.DataFrame:
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        df = con.execute(
+            """
+            WITH base AS (
+              SELECT
+                pi.ticker, pi.year, pi.quarter,
+                pi.pressure_index,
+                pi.z_pressure_language,
+                pi.z_inventory_to_sales,
+                cqm.pressure_language_score,
+                cqf.inventory_to_sales,
+                cqf.inventory_net_qoq_pct,
+                cqf.net_sales_qoq_pct,
+                cqf.pressure_qoq_pct,
+                cqf.inventory_to_sales_qoq_pct,
+                cqm.inventory, cqm.revenue, cqm.cogs, cqm.gross_profit, cqm.op_income,
+                cqm.kw_inventory, cqm.kw_promotion, cqm.kw_promotional, cqm.kw_markdown,
+                cqm.kw_demand, cqm.kw_traffic, cqm.kw_pricing, cqm.kw_guidance
+              FROM gold.pressure_index pi
+              LEFT JOIN gold.company_quarter_metrics cqm
+                USING (ticker, year, quarter)
+              LEFT JOIN gold.company_quarter_features cqf
+                USING (ticker, year, quarter)
+              WHERE pi.ticker = ?
+            )
+            SELECT * FROM base
+            ORDER BY year, quarter
+            """,
+            [ticker],
+        ).df()
+
+        if df.empty:
+            return df
+
+        df["period"] = df["year"].astype(int).astype(str) + " Q" + df["quarter"].astype(int).astype(str)
+        df["sort_key"] = df["year"].astype(int) * 10 + df["quarter"].astype(int)
+        return df
+    finally:
+        con.close()
+
+@st.cache_data(show_spinner=False)
+def load_recent_filings(db_path: Path, ticker: str) -> pd.DataFrame:
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        # filing-level signals
+        df = con.execute(
+            """
+            SELECT
+              ticker,
+              accession,
+              form,
+              filing_date,
+              report_date,
+              COALESCE(report_date, filing_date) AS dt,
+              kw_inventory, kw_promotion, kw_promotional, kw_markdown,
+              kw_demand, kw_traffic, kw_pricing, kw_guidance
+            FROM silver.filing_signals
+            WHERE ticker = ?
+            ORDER BY CAST(COALESCE(report_date, filing_date) AS DATE) DESC
+            LIMIT 25
+            """,
+            [ticker],
+        ).df()
+
+        if df.empty:
+            return df
+
+        df["year"] = pd.to_datetime(df["dt"]).dt.year
+        df["quarter"] = pd.to_datetime(df["dt"]).dt.quarter
+        df["period"] = df["year"].astype(str) + " Q" + df["quarter"].astype(str)
+        return df
+    finally:
+        con.close()
+
+tickers = load_tickers(DB)
+if not tickers:
+    st.error("No tickers found in gold.pressure_index. Run `make pipeline`.")
+    st.stop()
+
+
+
+with st.sidebar:
+    st.header("Controls")
+    ticker = st.selectbox("Ticker", tickers, index=0)
+    last_n = st.slider("Quarters to show", min_value=4, max_value=24, value=12, step=1)
+    threshold = st.slider("Flag threshold (pressure_index)", min_value=0.0, max_value=5.0, value=1.5, step=0.1)
+
+df = load_company_quarters(DB, ticker)
+
+if df.empty:
+    st.warning(f"No quarterly rows found for {ticker}.")
+    st.stop()
+
+# take last N quarters
+df = df.sort_values("sort_key").tail(last_n).reset_index(drop=True)
+
+# Choose which quarter to inspect (default: latest)
+periods = df["period"].tolist()
+selected_period = st.selectbox("Inspect quarter", periods, index=len(periods) - 1)
+
+row = df[df["period"] == selected_period].iloc[0]
+row_idx = df.index[df["period"] == selected_period][0]
+prev_row = df.iloc[row_idx - 1] if row_idx - 1 >= 0 else None
+
+def _fmt(v, fmt: str):
+    if v is None or pd.isna(v):
+        return "NA"
+    try:
+        return format(float(v), fmt)
+    except Exception:
+        return "NA"
+
+def _delta(curr, prev, col):
+    if prev is None:
+        return None
+    a = curr.get(col)
+    b = prev.get(col)
+    if pd.isna(a) or pd.isna(b):
+        return None
+    try:
+        return float(a) - float(b)
+    except Exception:
+        return None
+
+def _pct(curr, prev, col):
+    if prev is None:
+        return None
+    a = curr.get(col)
+    b = prev.get(col)
+    if pd.isna(a) or pd.isna(b):
+        return None
+    try:
+        a = float(a); b = float(b)
+        return None if b == 0 else (a - b) / b
+    except Exception:
+        return None
+
+
+curr = row.to_dict()
+prev = prev_row.to_dict() if prev_row is not None else None
+
+st.subheader("Latest snapshot (selected quarter)")
+c1, c2, c3, c4, c5 = st.columns(5)
+
+c1.metric("Period", curr.get("period"))
+
+c2.metric(
+    "pressure_index",
+    _fmt(curr.get("pressure_index"), ".2f"),
+    _fmt(_delta(curr, prev, "pressure_index"), "+.2f") if prev is not None else None,
+)
+
+c3.metric(
+    "z_pressure_language",
+    _fmt(curr.get("z_pressure_language"), ".2f"),
+    _fmt(_delta(curr, prev, "z_pressure_language"), "+.2f") if prev is not None else None,
+)
+
+c4.metric(
+    "z_inventory_to_sales",
+    _fmt(curr.get("z_inventory_to_sales"), ".2f"),
+    _fmt(_delta(curr, prev, "z_inventory_to_sales"), "+.2f") if prev is not None else None,
+)
+
+c5.metric(
+    "inventory_to_sales",
+    _fmt(curr.get("inventory_to_sales"), ".4f"),
+    _fmt(_delta(curr, prev, "inventory_to_sales"), "+.4f") if prev is not None else None,
+)
+
+if pd.notna(curr.get("pressure_index")) and float(curr["pressure_index"]) >= threshold:
+    st.error(f"Flag: {ticker} {curr['period']} pressure_index ({float(curr['pressure_index']):.2f}) ≥ {threshold:.1f}")
+
+df = df.sort_values("sort_key").reset_index(drop=True)
+
+# ---- Trends ----
+st.subheader("Trends")
+
+trend = df[["period", "pressure_index"]].set_index("period")
+st.line_chart(trend)
+
+components = df[["period", "z_pressure_language", "z_inventory_to_sales"]].set_index("period")
+st.line_chart(components)
+
+# ---- What drove selected quarter ----
+st.subheader("What drove the selected quarter?")
+
+driver_cols = [
+    "kw_inventory", "kw_promotion", "kw_promotional", "kw_markdown",
+    "kw_demand", "kw_traffic", "kw_pricing", "kw_guidance",
+]
+
+# Pull the keyword counts for the selected quarter
+kw = df.loc[row_idx, driver_cols].fillna(0).astype(float)
+
+kw_df = (
+    kw.rename(lambda x: x.replace("kw_", ""))
+      .to_frame(name="count")          # ensures we have a real "count" column
+      .reset_index()
+      .rename(columns={"index": "keyword"})
+)
+
+total = kw_df["count"].sum()
+kw_df["share"] = (kw_df["count"] / total) if total > 0 else 0.0
+kw_df = kw_df.sort_values("count", ascending=False).reset_index(drop=True)
+
+left, right = st.columns([1, 1])
+
+with left:
+    st.caption("Keyword counts (selected quarter)")
+    st.dataframe(kw_df, width="stretch", hide_index=True)
+
+with right:
+    st.bar_chart(kw_df.set_index("keyword")[["count"]])
+
+
+# ---- Detail table ----
+st.subheader("Quarterly detail")
+
+show_cols = [
+    "year", "quarter", "period",
+    "pressure_index", "pressure_language_score",
+    "inventory", "revenue", "cogs", "gross_profit", "op_income",
+    "inventory_to_sales",
+    "inventory_net_qoq_pct", "net_sales_qoq_pct",
+    "pressure_qoq_pct", "inventory_to_sales_qoq_pct",
+]
+detail = df[[c for c in show_cols if c in df.columns]].copy()
+st.dataframe(detail.sort_values(["year", "quarter"], ascending=False), width="stretch", hide_index=True)
+
+csv = detail.to_csv(index=False).encode("utf-8")
+st.download_button("Download quarterly detail (CSV)", data=csv, file_name=f"{ticker}_deep_dive.csv", mime="text/csv")
+
+# ---- Recent filings (filing-level) ----
+st.subheader("Recent filings (filing-level keyword signals)")
+
+fil = load_recent_filings(DB, ticker)
+if fil.empty:
+    st.info("No filing-level signals found for this ticker.")
+else:
+    st.dataframe(
+        fil[["period", "form", "filing_date", "report_date", "accession"] + driver_cols],
+        width="stretch",
+        hide_index=True,
+    )
