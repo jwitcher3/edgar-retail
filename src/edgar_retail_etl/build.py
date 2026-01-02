@@ -1,22 +1,16 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from duckdb import alias
-import pandas as pd
-import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
+
+import pandas as pd
 
 from .http_client import SecClient
 from .ingest import ticker_to_cik_map
-from .parse import (
-    extract_recent_filings,
-    filings_to_df,
-    html_to_text,
-    compute_keyword_counts,
-    primary_doc_url,
-)
+from .parse import extract_recent_filings, filings_to_df, html_to_text, compute_keyword_counts, primary_doc_url
+
 
 
 def build_silver(
@@ -33,9 +27,23 @@ def build_silver(
     cik_map = ticker_to_cik_map(tickers_parquet)
     forms_set = set(forms)
 
-    all_filings = []
-    all_signals = []
-    fact_rows = []
+    all_filings: list[pd.DataFrame] = []
+    all_signals: list[dict] = []
+    fact_rows: list[dict] = []
+    filing_text_rows: list[dict] = []
+
+    # stable schemas (prevents "no columns" parquet issues)
+    filings_cols = ["ticker", "cik", "accession", "form", "filing_date", "report_date", "primary_doc"]
+    signals_cols = (
+        ["ticker", "cik", "accession", "form", "filing_date", "report_date"]
+        + [f"kw_{k.lower()}" for k in keywords]
+    )
+    facts_cols = ["ticker", "cik", "tag", "unit", "val", "end", "filed", "form", "accn", "fp", "fy"]
+    filing_text_cols = [
+        "ticker", "cik", "accession", "form",
+        "filing_date", "report_date", "dt",
+        "url", "text", "text_len"
+    ]
 
     for t in [x.upper() for x in tickers]:
         cik = cik_map.get(t)
@@ -49,17 +57,21 @@ def build_silver(
 
         submissions = json.loads(sub_path.read_text(encoding="utf-8"))
         filings = extract_recent_filings(submissions, forms_set, filings_per_company)
+
         df_f = filings_to_df(filings)
         if not df_f.empty:
             df_f.insert(0, "ticker", t)
             all_filings.append(df_f)
 
-        # keyword signals from primary doc html
+        # keyword signals + filing text (primary doc)
         for f in filings:
             url = primary_doc_url(f)
             html_cache = bronze_dir / "filings" / t / f"{f.accession}.html"
             html = client.cached_get(url, html_cache, expect="text")
-            counts = compute_keyword_counts(html_to_text(html), keywords)
+
+            text = html_to_text(html)
+            counts = compute_keyword_counts(text, keywords)
+
             all_signals.append(
                 {
                     "ticker": t,
@@ -69,6 +81,22 @@ def build_silver(
                     "filing_date": f.filing_date,
                     "report_date": f.report_date,
                     **counts,
+                }
+            )
+
+            dt = f.report_date or f.filing_date
+            filing_text_rows.append(
+                {
+                    "ticker": t,
+                    "cik": f.cik,
+                    "accession": f.accession,
+                    "form": f.form,
+                    "filing_date": f.filing_date,
+                    "report_date": f.report_date,
+                    "dt": dt,
+                    "url": url,
+                    "text": text,
+                    "text_len": len(text) if text is not None else 0,
                 }
             )
 
@@ -102,14 +130,27 @@ def build_silver(
     filings_out = silver_dir / "filings.parquet"
     signals_out = silver_dir / "filing_signals.parquet"
     facts_out = silver_dir / "xbrl_facts_long.parquet"
+    filing_text_out = silver_dir / "filing_text.parquet"
 
-    (pd.concat(all_filings, ignore_index=True) if all_filings else pd.DataFrame()).to_parquet(
-        filings_out, index=False
-    )
-    pd.DataFrame(all_signals).to_parquet(signals_out, index=False)
-    pd.DataFrame(fact_rows).to_parquet(facts_out, index=False)
+    # Write schema-safe outputs
+    df_filings = pd.concat(all_filings, ignore_index=True) if all_filings else pd.DataFrame(columns=filings_cols)
+    df_filings = df_filings.reindex(columns=filings_cols)
+    df_filings.to_parquet(filings_out, index=False)
+
+    df_signals = pd.DataFrame(all_signals) if all_signals else pd.DataFrame(columns=signals_cols)
+    df_signals = df_signals.reindex(columns=signals_cols)
+    df_signals.to_parquet(signals_out, index=False)
+
+    df_facts = pd.DataFrame(fact_rows) if fact_rows else pd.DataFrame(columns=facts_cols)
+    df_facts = df_facts.reindex(columns=facts_cols)
+    df_facts.to_parquet(facts_out, index=False)
+
+    df_text = pd.DataFrame(filing_text_rows) if filing_text_rows else pd.DataFrame(columns=filing_text_cols)
+    df_text = df_text.reindex(columns=filing_text_cols)
+    df_text.to_parquet(filing_text_out, index=False)
 
     return filings_out, signals_out, facts_out
+
 
 
 def build_gold(
@@ -136,6 +177,7 @@ def build_gold(
 
     con.execute("DROP TABLE IF EXISTS silver.filing_signals;")
     con.execute("DROP TABLE IF EXISTS silver.xbrl_facts_long;")
+    con.execute("DROP TABLE IF EXISTS silver.filing_text;")  # NEW
 
     con.execute(
         "CREATE TABLE silver.filing_signals AS SELECT * FROM read_parquet(?);",
@@ -145,6 +187,11 @@ def build_gold(
         "CREATE TABLE silver.xbrl_facts_long AS SELECT * FROM read_parquet(?);",
         [str(silver_dir / "xbrl_facts_long.parquet")],
     )
+    con.execute(  # NEW
+        "CREATE TABLE silver.filing_text AS SELECT * FROM read_parquet(?);",
+        [str(silver_dir / "filing_text.parquet")],
+    )
+
 
     con.execute("DROP TABLE IF EXISTS gold.quarter_facts;")
 

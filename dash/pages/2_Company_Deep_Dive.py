@@ -4,6 +4,7 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 import streamlit as st
+import re
 
 st.set_page_config(page_title="Company Deep Dive", layout="wide")
 
@@ -16,6 +17,37 @@ st.caption("Quarterly pressure signals + financial context pulled from SEC EDGAR
 if not DB.exists():
     st.error("DuckDB not found. Run: `make pipeline` (or `make gold`) first.")
     st.stop()
+
+@st.cache_data(show_spinner=False)
+def load_filing_text(db_path: Path, ticker: str, accession: str) -> pd.DataFrame:
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        return con.execute(
+            """
+            SELECT ticker, accession, form, filing_date, report_date, dt, url, text, text_len
+            FROM silver.filing_text
+            WHERE ticker = ? AND accession = ?
+            LIMIT 1
+            """,
+            [ticker, accession],
+        ).df()
+    finally:
+        con.close()
+
+def extract_snippets(text: str, term: str, window: int = 160, max_hits: int = 3) -> list[str]:
+    if not text or not term:
+        return []
+    lower = text.lower()
+    term_l = term.lower()
+    hits = [m.start() for m in re.finditer(re.escape(term_l), lower)]
+    out = []
+    for start in hits[:max_hits]:
+        end = start + len(term_l)
+        left = max(0, start - window)
+        right = min(len(text), end + window)
+        out.append(text[left:right].replace("\n", " "))
+    return out
+
 
 @st.cache_data(show_spinner=False)
 def load_tickers(db_path: Path) -> list[str]:
@@ -131,6 +163,8 @@ df = df.sort_values("sort_key").tail(last_n).reset_index(drop=True)
 periods = df["period"].tolist()
 selected_period = st.selectbox("Inspect quarter", periods, index=len(periods) - 1)
 
+df = df.sort_values("sort_key").reset_index(drop=True)
+
 row = df[df["period"] == selected_period].iloc[0]
 row_idx = df.index[df["period"] == selected_period][0]
 prev_row = df.iloc[row_idx - 1] if row_idx - 1 >= 0 else None
@@ -204,7 +238,7 @@ c5.metric(
 if pd.notna(curr.get("pressure_index")) and float(curr["pressure_index"]) >= threshold:
     st.error(f"Flag: {ticker} {curr['period']} pressure_index ({float(curr['pressure_index']):.2f}) ≥ {threshold:.1f}")
 
-df = df.sort_values("sort_key").reset_index(drop=True)
+
 
 # ---- Trends ----
 st.subheader("Trends")
@@ -276,3 +310,75 @@ else:
         width="stretch",
         hide_index=True,
     )
+st.subheader("Filing Explorer")
+
+if fil.empty:
+    st.info("No filings to explore.")
+else:
+    fil2 = fil.copy()
+    fil2["label"] = fil2["period"] + " • " + fil2["form"] + " • " + fil2["accession"]
+    fil2["dt"] = pd.to_datetime(fil2["dt"], errors="coerce")
+    fil2 = fil2.sort_values("dt", ascending=False)
+
+    label = st.selectbox("Select a filing", fil2["label"].tolist(), index=0)
+    accn = fil2.loc[fil2["label"] == label, "accession"].iloc[0]
+
+    ft = load_filing_text(DB, ticker, accn)
+    if ft.empty:
+        st.error("No filing text found in silver.filing_text for this accession. Re-run `make pipeline`.")
+    else:
+        meta = ft.iloc[0].to_dict()
+        text_blob = meta.get("text") or ""
+
+        st.markdown(f"**SEC URL:** {meta.get('url')}")
+        st.link_button("Open on SEC", meta.get("url"))
+        st.caption(f"Text length: {int(meta.get('text_len') or 0):,} characters")
+
+        # keyword counts for this filing (from fil row)
+        driver_cols = [
+            "kw_inventory", "kw_promotion", "kw_promotional", "kw_markdown",
+            "kw_demand", "kw_traffic", "kw_pricing", "kw_guidance",
+        ]
+        r = fil2[fil2["accession"] == accn].iloc[0]
+        counts = r[driver_cols].fillna(0).astype(int)
+
+        counts_df = (
+            counts.rename(lambda x: x.replace("kw_", ""))
+                  .to_frame("count")
+                  .reset_index()
+                  .rename(columns={"index": "keyword"})
+                  .sort_values("count", ascending=False)
+        )
+        st.dataframe(counts_df, width="stretch", hide_index=True)
+
+        # snippet picker
+        default_terms = counts_df.loc[counts_df["count"] > 0, "keyword"].head(3).tolist()
+        terms = st.multiselect(
+            "Show snippets for keywords",
+            options=counts_df["keyword"].tolist(),
+            default=default_terms,
+        )
+        custom = st.text_input("Custom term (optional)", value="")
+
+        terms_to_search = [t for t in terms if t] + ([custom] if custom else [])
+        if not terms_to_search:
+            st.info("Pick at least one keyword (or type a custom term).")
+        else:
+            for term in terms_to_search:
+                snippets = extract_snippets(text_blob, term, window=180, max_hits=3)
+                st.markdown(f"#### `{term}`")
+                if not snippets:
+                    st.write("No matches found.")
+                else:
+                    for s in snippets:
+                        st.write(s)
+
+        with st.expander("Preview raw filing text (first 10,000 chars)"):
+            st.text(text_blob[:10000])
+
+        st.download_button(
+            "Download full filing text (TXT)",
+            data=text_blob.encode("utf-8", errors="ignore"),
+            file_name=f"{ticker}_{accn}.txt",
+            mime="text/plain",
+        )
