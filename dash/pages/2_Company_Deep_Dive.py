@@ -39,7 +39,7 @@ def split_into_segments(text: str, max_len: int = 650, min_len: int = 80) -> lis
             segs.append(p)
             continue
 
-        # Chunk long paragraph into ~max_len blocks using sentence-ish splits
+        
         sentences = sentence_split.split(p)
         buf = ""
         for s in sentences:
@@ -302,6 +302,46 @@ if not tickers:
     st.error("No tickers found in gold.pressure_index. Run `make pipeline`.")
     st.stop()
 
+@st.cache_data(show_spinner=False)
+def load_filing_texts_for_period(
+    db_path: Path,
+    ticker: str,
+    year: int,
+    quarter: int,
+    limit: int = 10,
+) -> pd.DataFrame:
+    """
+    Pull filing text rows for a ticker in a given year/quarter.
+    Uses silver.filing_text.dt to compute year/quarter.
+    """
+    con = duckdb.connect(str(db_path), read_only=True)
+    try:
+        return con.execute(
+            """
+            SELECT
+              ticker,
+              accession,
+              form,
+              filing_date,
+              report_date,
+              dt,
+              url,
+              text,
+              text_len
+            FROM silver.filing_text
+            WHERE ticker = ?
+              AND dt IS NOT NULL
+              AND EXTRACT(year FROM CAST(dt AS DATE)) = ?
+              AND EXTRACT(quarter FROM CAST(dt AS DATE)) = ?
+            ORDER BY CAST(dt AS DATE) DESC
+            LIMIT ?
+            """,
+            [ticker, int(year), int(quarter), int(limit)],
+        ).df()
+    finally:
+        con.close()
+
+
 
 
 with st.sidebar:
@@ -398,6 +438,70 @@ c5.metric(
 if pd.notna(curr.get("pressure_index")) and float(curr["pressure_index"]) >= threshold:
     st.error(f"Flag: {ticker} {curr['period']} pressure_index ({float(curr['pressure_index']):.2f}) ≥ {threshold:.1f}")
 
+def top_excerpts_multi(
+    filings_df: pd.DataFrame,
+    terms: list[str],
+    top_n: int = 10,
+    per_filing_cap: int = 6,
+) -> list[dict]:
+    """
+    Generate top excerpts across multiple filings in a quarter.
+
+    Strategy:
+      - run top_excerpts per filing (cap per filing)
+      - combine + near-duplicate suppress globally (re-uses _is_too_similar)
+      - keep best top_n overall
+    """
+    terms = [t.strip() for t in terms if t and t.strip()]
+    if filings_df is None or filings_df.empty or not terms:
+        return []
+
+    combined: list[dict] = []
+
+    for _, r in filings_df.iterrows():
+        txt = r.get("text") or ""
+        if not txt:
+            continue
+
+        exs = top_excerpts(txt, terms, top_n=per_filing_cap)
+        for ex in exs:
+            combined.append(
+                {
+                    "score": ex["score"],
+                    "hits": ex["hits"],
+                    "text": ex["text"],
+                    "accession": r.get("accession"),
+                    "form": r.get("form"),
+                    "dt": r.get("dt"),
+                    "url": r.get("url"),
+                }
+            )
+
+    combined.sort(key=lambda x: x["score"], reverse=True)
+
+    picked: list[dict] = []
+    for ex in combined:
+        if any(_is_too_similar(ex["text"], p["text"]) for p in picked):
+            continue
+        picked.append(ex)
+        if len(picked) >= top_n:
+            break
+
+    return picked
+
+@st.cache_data(show_spinner=False)
+def cached_quarter_excerpts(
+    ticker: str,
+    year: int,
+    quarter: int,
+    terms_tuple: tuple[str, ...],
+    top_n: int,
+    filings_limit: int,
+    per_filing_cap: int,
+    db_path_str: str,
+):
+    dfq = load_filing_texts_for_period(Path(db_path_str), ticker, year, quarter, limit=filings_limit)
+    return top_excerpts_multi(dfq, list(terms_tuple), top_n=top_n, per_filing_cap=per_filing_cap)
 
 
 # ---- Trends ----
@@ -418,7 +522,13 @@ driver_cols = [
 ]
 
 # Pull the keyword counts for the selected quarter
-kw = df.loc[row_idx, driver_cols].fillna(0).astype(float)
+kw = (
+    df.loc[row_idx, driver_cols]
+      .infer_objects(copy=False)
+      .fillna(0)
+      .astype(float)
+)
+
 
 kw_df = (
     kw.rename(lambda x: x.replace("kw_", ""))
@@ -439,6 +549,71 @@ with left:
 
 with right:
     st.bar_chart(kw_df.set_index("keyword")[["count"]])
+
+# ---- C4: Quarter excerpts (across filings in selected quarter) ----
+st.subheader("Quarter excerpts (across filings)")
+
+q_year = int(row["year"])
+q_quarter = int(row["quarter"])
+
+# controls
+cA, cB, cC = st.columns([2, 1, 1])
+with cA:
+    # Use quarter keywords as options; default: top 3 nonzero
+    quarter_keyword_options = kw_df["keyword"].tolist()
+    default_q_terms = kw_df.loc[kw_df["count"] > 0, "keyword"].head(3).tolist()
+    q_terms = st.multiselect(
+        "Terms to rank excerpts by",
+        options=quarter_keyword_options,
+        default=default_q_terms,
+        key="q_excerpt_terms",
+    )
+    q_custom = st.text_input("Custom term (optional)", value="", key="q_excerpt_custom")
+with cB:
+    filings_limit = st.slider("Filings to scan", 1, 25, 8, 1, key="q_excerpt_filings_limit")
+with cC:
+    q_top_n = st.slider("Excerpts to show", 3, 20, 8, 1, key="q_excerpt_top_n")
+
+q_terms_to_use = [t for t in q_terms if t] + ([q_custom] if q_custom else [])
+
+if not q_terms_to_use:
+    st.info("Pick at least one term (or add a custom term) to generate quarter excerpts.")
+else:
+    # You can use cached_quarter_excerpts (recommended) or call directly.
+    excerpts = cached_quarter_excerpts(
+        ticker=ticker,
+        year=q_year,
+        quarter=q_quarter,
+        terms_tuple=tuple(q_terms_to_use),
+        top_n=int(q_top_n),
+        filings_limit=int(filings_limit),
+        per_filing_cap=6,
+        db_path_str=str(DB),
+    )
+
+    if not excerpts:
+        st.info("No excerpts found for those terms in this quarter.")
+    else:
+        for i, ex in enumerate(excerpts, start=1):
+            hits_str = ", ".join(
+                f"{k}×{v}" for k, v in sorted(ex["hits"].items(), key=lambda kv: (-kv[1], kv[0]))
+            )
+            meta = f"{ex.get('form') or ''} • {ex.get('dt') or ''} • {ex.get('accession') or ''}".strip(" •")
+
+            st.markdown(f"**#{i}** • **Score:** {ex['score']:.2f} • **Hits:** {hits_str}")
+            st.caption(meta)
+
+            if ex.get("url"):
+                st.markdown(f"[Open filing on SEC]({ex['url']})")
+
+
+            box = highlight_terms(ex["text"], q_terms_to_use)
+            st.markdown(
+                f"<div style='padding:0.75rem 0.9rem;border:1px solid #e5e7eb;border-radius:12px;background:#fafafa;line-height:1.45'>"
+                f"{box}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ---- Detail table ----
@@ -491,7 +666,9 @@ else:
         text_blob = meta.get("text") or ""
 
         st.markdown(f"**SEC URL:** {meta.get('url')}")
-        st.link_button("Open on SEC", meta.get("url"))
+        if meta.get("url"):
+            st.markdown(f"[Open on SEC]({meta['url']})")
+
         st.caption(f"Text length: {int(meta.get('text_len') or 0):,} characters")
 
         # keyword counts for this filing (from fil row)
