@@ -7,5 +7,6 @@ data/gold/
 data/warehouse.duckdb
 config.yaml
 .DS_Store
+*.duckdb
 data/
 
