@@ -4,6 +4,7 @@ __pycache__/
 data/bronze/
 data/silver/
 data/gold/
+data/exports/
 data/warehouse.duckdb
 config.yaml
 .DS_Store

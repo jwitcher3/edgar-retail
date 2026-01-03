@@ -4,9 +4,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-
 import pandas as pd
-
 from .http_client import SecClient
 from .ingest import ticker_to_cik_map
 from .parse import extract_recent_filings, filings_to_df, html_to_text, compute_keyword_counts, primary_doc_url

@@ -47,3 +47,8 @@ help:
 	@echo "  make app        - launch Streamlit dashboard"
 	@echo "  make check      - quick import check"
 	@echo ""
+
+smoke:
+	$(ENV) $(PY) -m edgar_retail_etl.cli silver --config $(CONFIG)
+	$(ENV) $(PY) -m edgar_retail_etl.cli gold --config $(CONFIG)
+	$(ENV) $(PY) -m edgar_retail_etl.cli validate --config $(CONFIG)
