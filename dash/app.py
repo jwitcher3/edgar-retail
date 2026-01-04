@@ -6,6 +6,36 @@ import streamlit as st
 
 st.set_page_config(page_title="EDGAR Retail ETL", layout="wide")
 
+with st.sidebar:
+    st.markdown("### James Witcher")
+    st.caption("Marketing / Product Analytics • Data Science")
+    st.markdown("✉️ [james.witcher@outlook.com](mailto:james.witcher@outlook.com)")
+    st.markdown("🔗 [GitHub](https://github.com/jwitcher3)  •  [LinkedIn](https://www.linkedin.com/in/james-witcher/)")
+    st.divider()
+
+
+st.title("EDGAR Retail: Pressure Signals")
+st.caption("Quarterly pressure signals + financial context pulled from SEC EDGAR filings (DuckDB gold tables).")
+
+with st.expander("How to use this app", expanded=True):
+    st.markdown(
+        """
+1) **Start here (Home):** pick a few tickers and scan pressure levels + trends.  
+2) **Company Deep Dive:** choose a ticker → choose a quarter → review:
+   - pressure_index + components
+   - keyword driver mix (inventory / promotion / demand / pricing / guidance)
+   - top excerpts across filings for that quarter (with links)
+3) **Exports:** download quarter bundles (CSV / MD / PDF / ZIP) for sharing.
+        """
+    )
+
+col1, col2 = st.columns(2)
+with col1:
+    st.page_link("dash/pages/2_Company_Deep_Dive.py", label="➡️ Open Company Deep Dive", icon="📊")
+with col2:
+    st.page_link("dash/pages/02_Data_Quality.py", label="➡️ Open Data Quality", icon="✅")
+
+
 ROOT = Path(__file__).resolve().parents[1]
 DB = ROOT / "data" / "warehouse.duckdb"
 
