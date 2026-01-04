@@ -8,3 +8,4 @@ tenacity>=8.4.2
 lxml>=5.2.2
 beautifulsoup4>=4.12.3
 streamlit>=1.36.0
+reportlab==4.4.7
