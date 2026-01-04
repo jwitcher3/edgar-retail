@@ -1,23 +1,14 @@
-.venv/
-__pycache__/
-*.pyc
+# keep big raw layers ignored
 data/bronze/
 data/silver/
 data/gold/
 data/exports/
 
-config.yaml
-.DS_Store
-
-# Ignore everything under data by default…
-data/**
-
-# …but keep the warehouse DB and README
+# ignore duckdb generally...
+*.duckdb
+# ...but allow the deployable warehouse
 !data/warehouse.duckdb
-!data/README.md
 
-# Keep exports out
-data/exports/
 
 
 
