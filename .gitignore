@@ -3,9 +3,8 @@ __pycache__/
 *.pyc
 .DS_Store
 
-# Ignore all generated data by default…
-data/*
-# …but keep the one file we need to deploy
+# But DO track the DuckDB warehouse file
+!data/
 !data/warehouse.duckdb
 
 # still ignore exports + intermediate dirs if you want them never committed

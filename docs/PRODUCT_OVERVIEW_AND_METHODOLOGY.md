@@ -367,12 +367,19 @@ make gold
 make validate
 make app
 
+---
+
 ## Appendix B — Configuration
 
-config.yaml controls:
-    * tickers
-    * filing types
-    * filing lookback count
-    * keywords
-    * XBRL tag fallbacks
-    * SEC user-agent must include contact info per SEC guidance.
+### `config.yaml` controls
+
+- **Tickers**: which companies to ingest and analyze
+- **Filing types**: which SEC forms to pull (e.g., `10-K`, `10-Q`)
+- **Filing lookback count**: how many recent filings to ingest per company
+- **Keywords**: the driver terms used to compute filing language signals and rank excerpts
+- **XBRL tag fallbacks**: the prioritized list of XBRL tag names to use per metric (inventory, revenue, COGS, etc.) when filers vary in tag naming
+
+### SEC user-agent requirement
+
+The SEC requires programmatic access to include a **user-agent string with identifying contact information** (name + email) per SEC guidance.
+
