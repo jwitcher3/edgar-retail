@@ -5,9 +5,18 @@ data/bronze/
 data/silver/
 data/gold/
 data/exports/
-data/warehouse.duckdb
+
 config.yaml
 .DS_Store
-*.duckdb
-data/
+
+# Ignore everything under data by default…
+data/**
+
+# …but keep the warehouse DB and README
+!data/warehouse.duckdb
+!data/README.md
+
+# Keep exports out
+data/exports/
+
 
