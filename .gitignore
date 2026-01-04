@@ -1,14 +1,18 @@
-# keep big raw layers ignored
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# Ignore all generated data by default…
+data/*
+# …but keep the one file we need to deploy
+!data/warehouse.duckdb
+
+# still ignore exports + intermediate dirs if you want them never committed
+data/exports/
 data/bronze/
 data/silver/
 data/gold/
-data/exports/
 
-# ignore duckdb generally...
-*.duckdb
-# ...but allow the deployable warehouse
-!data/warehouse.duckdb
-
-
-
+config.yaml
 
