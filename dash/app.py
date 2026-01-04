@@ -31,9 +31,9 @@ with st.expander("How to use this app", expanded=True):
 
 col1, col2 = st.columns(2)
 with col1:
-    st.page_link("dash/pages/2_Company_Deep_Dive.py", label="➡️ Open Company Deep Dive", icon="📊")
+    st.page_link("pages/2_Company_Deep_Dive.py", label="➡️ Open Company Deep Dive", icon="📊")
 with col2:
-    st.page_link("dash/pages/02_Data_Quality.py", label="➡️ Open Data Quality", icon="✅")
+    st.page_link("pages/02_Data_Quality.py", label="➡️ Open Data Quality", icon="✅")
 
 
 ROOT = Path(__file__).resolve().parents[1]
