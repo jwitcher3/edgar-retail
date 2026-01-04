@@ -360,12 +360,14 @@ Recommended workflow:
 
 ## Appendix A — How to run locally
 
-- ```bash
-- make ingest
-- make silver
-- make gold
-- make validate
-- make app
+
+```bash
+make ingest
+make silver
+make gold
+make validate
+make app
+```
 
 ---
 
