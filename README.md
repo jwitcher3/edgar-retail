@@ -30,7 +30,9 @@ cp config.example.yaml config.yaml
 ![Home](docs/images/home.png)
 
 ### Company Deep Dive
-![Deep Dive](docs/images/deep_dive.png)
+![Deep Dive](docs/images/deep_dive_1.png)
 
-### Evidence Excerpts
-![Excerpts](docs/images/excerpts.png)
+![Deep Dive](docs/images/deep_dive_2.png)
+
+### Data Quality Checks
+![Excerpts](docs/images/data_quality.png)
