@@ -8,6 +8,7 @@ make install
 make ingest
 make pipeline
 make app
+```
 
 
 ## Setup
@@ -18,3 +19,4 @@ pip install -r requirements.txt
 
 cp config.example.yaml config.yaml
 # edit config.yaml: sec.user_agent must include contact info
+```
