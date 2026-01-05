@@ -20,3 +20,17 @@ pip install -r requirements.txt
 cp config.example.yaml config.yaml
 # edit config.yaml: sec.user_agent must include contact info
 ```
+
+
+## Screenshoots
+
+## Screenshots
+
+### Home (Watchlist)
+![Home](docs/images/home.png)
+
+### Company Deep Dive
+![Deep Dive](docs/images/deep_dive.png)
+
+### Evidence Excerpts
+![Excerpts](docs/images/excerpts.png)
